@@ -1,0 +1,17 @@
+{
+  "id": "d8b93139-50bd-4ba7-9adb-dd226f5e8c58",
+  "name": "universal-db-backup",
+  "projectId": "9742b893-75f0-453f-95e5-571c4e621456",
+  "ports": [
+    {
+      "expose": true,
+      "number": 3000
+    }
+  ],
+  "publicAccess": {
+    "enabled": true,
+    "domain": "auto"
+  },
+  "resourceTier": "t1",
+  "dockerFileName": "Dockerfile"
+}
