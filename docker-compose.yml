@@ -1,0 +1,51 @@
+# docker-compose.yml
+# نسخة معدلة ومحسّنة للعمل على المنصات السحابية
+
+version: '3.8'
+
+services:
+  # الخدمة الأولى: قاعدة البيانات PostgreSQL
+  postgresql:
+    image: postgres:16-alpine
+    container_name: ilibrary_db_container
+    restart: always
+    environment:
+      POSTGRES_DB: ilibrarydb
+      POSTGRES_USER: abdyousef
+      POSTGRES_PASSWORD: ilibrary2025!
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # ✅ **التعديل: لا تقم بتعريض المنفذ للخارج إلا إذا كنت تحتاجه**
+    # هذا يجعل قاعدة البيانات أكثر أماناً، لأنها ستكون متاحة فقط للتطبيق
+    # ports:
+    #   - "5433:5432"
+    networks:
+      - app-network # اجعل هذه الخدمة جزءاً من شبكتنا المخصصة
+
+  # الخدمة الثانية: تطبيق Next.js الخاص بك
+  app:
+    build: .
+    container_name: ilibrary_app_container
+    restart: always
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgresql
+    environment:
+      # ✅ **التعديل: التأكد من أن التطبيق يستخدم اسم الخدمة الصحيح**
+      # هذا هو أهم جزء. نخبر التطبيق أن قاعدة البيانات موجودة على "postgresql"
+      DATABASE_URL: "postgresql://abdyousef:ilibrary2025!@postgresql:5432/ilibrarydb"
+      # من الأفضل عدم استخدام localhost هنا، لكنه سيعمل في معظم الحالات
+      NEXT_PUBLIC_API_URL: "http://localhost:3000/api" 
+    networks:
+      - app-network # اجعل هذه الخدمة أيضاً جزءاً من نفس الشبكة
+
+# ✅ **الجديد هنا: تعريف الشبكة المخصصة**
+# هذا يضمن أن كل الخدمات في شبكة واحدة معزولة وموثوقة
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+

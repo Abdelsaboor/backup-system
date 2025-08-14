@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,13 +7,24 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ✅ إضافة نوع جديد للحالة
+enum BackupStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
 model BackupRecord {
-  id          String   @id @default(cuid())
+  id          String       @id @default(cuid())
   dbName      String
-  status      String   // pending, completed, failed
-  createdAt   DateTime @default(now())
+  status      BackupStatus @default(QUEUED) // ✅ استخدام النوع الجديد
+  createdAt   DateTime     @default(now())
   completedAt DateTime?
   fileName    String?
   downloadUrl String?
   error       String?
+
+  // ✅ إضافة حقل جديد لتخزين إعدادات النسخ الاحتياطي
+  configJson String
 }

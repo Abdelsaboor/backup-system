@@ -1,9 +1,57 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { spawn } from 'child_process';
-import fs from 'fs';
 import path from 'path';
-import AWS from 'aws-sdk';
-import { prisma } from '../../lib/db';
+import fs from 'fs';
+import { randomUUID } from 'crypto';
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { PassThrough } from 'stream';
+
+// --- Helper Types and Functions for History Logging ---
+type BackupStatus = 'COMPLETED' | 'FAILED' | 'PROCESSING' | 'QUEUED' | 'CANCELLED';
+type BackupRecord = {
+    id: string;
+    dbName: string;
+    status: BackupStatus;
+    createdAt: string;
+    fileName?: string;
+    error?: string;
+    downloadUrl?: string;
+};
+
+const DB_PATH = path.resolve(process.cwd(), 'backup-history.json');
+
+const readRecords = async (): Promise<BackupRecord[]> => {
+    try {
+        if (!fs.existsSync(DB_PATH)) {
+            await fs.promises.writeFile(DB_PATH, JSON.stringify([]), 'utf-8');
+            return [];
+        }
+        const fileContent = await fs.promises.readFile(DB_PATH, 'utf-8');
+        return fileContent ? JSON.parse(fileContent) : [];
+    } catch (error) {
+        console.error("Error reading backup history:", error);
+        return [];
+    }
+};
+
+const writeRecords = async (records: BackupRecord[]): Promise<void> => {
+    try {
+        await fs.promises.writeFile(DB_PATH, JSON.stringify(records, null, 2), 'utf-8');
+    } catch (error) {
+        console.error("Error writing backup history:", error);
+    }
+};
+
+// --- Main API Handler ---
+const sendStreamMessage = (res: NextApiResponse, data: object) => {
+    try {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {
+        console.error("Failed to write to stream:", e);
+    }
+};
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -11,99 +59,105 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    const sendEvent = (data: object) => {
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
+    const {
+        dbHost, dbPort, dbUser, dbPassword, dbName, dbRequireSsl,
+        s3Endpoint, s3BucketName, s3AccessKey, s3SecretKey, s3Region
+    } = req.query;
+
+    const recordId = randomUUID();
+    // ✅ **التعديل: تغيير امتداد الملف إلى .dump**
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFileName = `${dbName as string}_${timestamp}.dump`;
+    
+    const backupsDir = path.resolve(process.cwd(), 'backups');
+    const backupFilePath = path.join(backupsDir, backupFileName);
+    if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir);
+
+    const newRecord: BackupRecord = { id: recordId, dbName: dbName as string, status: 'PROCESSING', createdAt: new Date().toISOString(), fileName: backupFileName };
+    const records = await readRecords();
+    records.push(newRecord);
+    await writeRecords(records);
+
+    const pgDumpPath = path.resolve(process.cwd(), 'vendor', 'pg_dump.exe');
+    if (!fs.existsSync(pgDumpPath)) { /* ... handle error ... */ return; }
+    
+    const args: string[] = [
+        '--format=c', '--blobs', '--verbose',
+        `--host=${dbHost}`, `--port=${dbPort}`,
+        `--username=${dbUser}`, `--dbname=${dbName}`,
+    ];
+    
+    const env: NodeJS.ProcessEnv = { ...process.env, PGPASSWORD: dbPassword as string, PGSSLMODE: dbRequireSsl === 'true' ? 'require' : 'prefer' };
+    const backupProcess = spawn(pgDumpPath, args, { env });
+
+    // ✅ **الجديد هنا: إيقاف العملية عند إغلاق الاتصال**
+    req.on('close', async () => {
+        console.log("Client disconnected. Terminating backup process...");
+        backupProcess.kill(); // Stop the pg_dump process
+        const finalRecords = await readRecords();
+        const recordIndex = finalRecords.findIndex(r => r.id === recordId);
+        if (recordIndex > -1 && finalRecords[recordIndex].status === 'PROCESSING') {
+            finalRecords[recordIndex].status = 'CANCELLED';
+            finalRecords[recordIndex].error = 'Process cancelled by user.';
+            await writeRecords(finalRecords);
+        }
+        res.end();
+    });
+
+    const s3Client = new S3Client({
+        endpoint: s3Endpoint as string,
+        region: s3Region as string,
+        credentials: { accessKeyId: s3AccessKey as string, secretAccessKey: s3SecretKey as string }
+    });
+
+    const passThrough = new PassThrough();
+    passThrough.pipe(fs.createWriteStream(backupFilePath));
+
+    const s3Upload = new Upload({
+        client: s3Client,
+        params: { Bucket: s3BucketName as string, Key: backupFileName, Body: passThrough, ContentType: 'application/octet-stream' },
+    });
+
+    if (backupProcess.stdout) backupProcess.stdout.pipe(passThrough);
+
+    let errorOutput = '';
+    if (backupProcess.stderr) {
+        backupProcess.stderr.on('data', (data: Buffer | string) => {
+            errorOutput += data.toString();
+            sendStreamMessage(res, { message: data.toString().trim() });
+        });
+    }
 
     try {
-        // ✅ الحل النهائي: تنظيف كل المدخلات من المسافات الفارغة
-        const query = req.query as { [key: string]: string };
-        const trimmedQuery: { [key: string]: any } = {};
-        for (const key in query) {
-            trimmedQuery[key] = typeof query[key] === 'string' ? query[key].trim() : query[key];
+        await s3Upload.done();
+        sendStreamMessage(res, { message: "✅ S3 upload completed successfully." });
+
+        // ✅ **الجديد هنا: إنشاء رابط تحميل آمن ومؤقت**
+        const command = new GetObjectCommand({ Bucket: s3BucketName as string, Key: backupFileName });
+        const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 }); // Link expires in 1 hour
+
+        const finalRecords = await readRecords();
+        const recordIndex = finalRecords.findIndex(r => r.id === recordId);
+        if (recordIndex > -1) {
+            finalRecords[recordIndex].status = 'COMPLETED';
+            finalRecords[recordIndex].downloadUrl = signedUrl; // Save the working link
+            await writeRecords(finalRecords);
         }
+        sendStreamMessage(res, { message: "All tasks finished.", status: 'completed' });
 
-        const {
-            dbType, dbHost, dbPort, dbUser, dbPassword, dbName, dbRequireSsl,
-            s3Endpoint, s3BucketName, s3AccessKey, s3SecretKey, s3Region
-        } = trimmedQuery;
-
-        if (!dbType || !dbName) {
-            throw new Error('Database type and name are required.');
+    } catch (err: any) {
+        sendStreamMessage(res, { message: `❌ S3 Upload Failed: ${err.message}`, status: 'failed' });
+        const finalRecords = await readRecords();
+        const recordIndex = finalRecords.findIndex(r => r.id === recordId);
+        if (recordIndex > -1) {
+            finalRecords[recordIndex].status = 'FAILED';
+            finalRecords[recordIndex].error = `S3 Error: ${err.message}`;
+            await writeRecords(finalRecords);
         }
-
-        sendEvent({ message: `Starting backup for ${dbType} database: '${dbName}'...` });
-
-        const record = await prisma.backupRecord.create({
-            data: { dbName, status: 'pending' },
-        });
-
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        let fileName = '';
-        let command: string;
-        let args: string[];
-        const env = { ...process.env, PGPASSWORD: dbPassword };
-
-        switch (dbType) {
-            case 'postgresql':
-                fileName = `backup-pg-${dbName}-${timestamp}.dump`;
-                const connectionString = `postgresql://${dbUser}:${encodeURIComponent(dbPassword || '')}@${dbHost}:${dbPort}/${dbName}${dbRequireSsl === 'true' ? '?sslmode=require' : ''}`;
-                command = 'pg_dump';
-                args = [connectionString, '-F', 'c', '--no-password'];
-                break;
-            default:
-                throw new Error('Unsupported database type');
-        }
-        
-        const filePath = path.join('/tmp', fileName);
-        const backupProcess = spawn(command, args, { env });
-        const fileWriteStream = fs.createWriteStream(filePath);
-        backupProcess.stdout.pipe(fileWriteStream);
-
-        backupProcess.stderr.on('data', (data) => {
-            sendEvent({ message: data.toString().trim() });
-        });
-
-        backupProcess.on('close', async (code) => {
-            if (code === 0) {
-                sendEvent({ message: 'Database dump successful. Now uploading to S3...', status: 'uploading' });
-                
-                const s3 = new AWS.S3({ endpoint: s3Endpoint, accessKeyId: s3AccessKey, secretAccessKey: s3SecretKey, region: s3Region, s3ForcePathStyle: true });
-                try {
-                    const fileStream = fs.createReadStream(filePath);
-                    await s3.upload({ Bucket: s3BucketName, Key: fileName, Body: fileStream }).promise();
-                    
-                    const downloadUrl = s3.getSignedUrl('getObject', { Bucket: s3BucketName, Key: fileName, Expires: 3600 });
-                    sendEvent({ message: 'Upload complete! ✅', status: 'completed' });
-                    await prisma.backupRecord.update({
-                        where: { id: record.id },
-                        data: { status: 'completed', fileName, downloadUrl, completedAt: new Date() }
-                    });
-
-                } catch (s3Error: any) {
-                    sendEvent({ message: `S3 Upload failed: ${s3Error.message}`, status: 'failed' });
-                    await prisma.backupRecord.update({ where: { id: record.id }, data: { status: 'failed', error: s3Error.message, completedAt: new Date() }});
-                } finally {
-                    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-                    res.end();
-                }
-            } else {
-                const errorMsg = `Backup process failed. Check credentials and network access.`;
-                sendEvent({ message: errorMsg, status: 'failed' });
-                await prisma.backupRecord.update({ where: { id: record.id }, data: { status: 'failed', error: errorMsg, completedAt: new Date() }});
-                res.end();
-            }
-        });
-
-        backupProcess.on('error', async (err) => {
-            const errorMsg = `Failed to start backup process: ${err.message}`;
-            sendEvent({ message: errorMsg, status: 'failed' });
-            await prisma.backupRecord.update({ where: { id: record.id }, data: { status: 'failed', error: errorMsg, completedAt: new Date() }});
+    } finally {
+        if (!res.writableEnded) {
+            sendStreamMessage(res, { status: 'closed' });
             res.end();
-        });
-
-    } catch (error: any) {
-        sendEvent({ message: `An error occurred: ${error.message}`, status: 'failed' });
-        res.end();
+        }
     }
 }

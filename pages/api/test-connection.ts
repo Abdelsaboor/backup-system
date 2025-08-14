@@ -1,53 +1,97 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { exec } from 'child_process';
+// Import the official Node.js clients for each database
+import { Client as PgClient } from 'pg';
+import mysql from 'mysql2/promise';
+import { MongoClient } from 'mongodb';
 
-export default function handler(req: NextApiRequest, res: NextApiResponse) {
+/**
+ * Handles testing the connection to a database.
+ * This version uses native Node.js drivers instead of command-line tools,
+ * which is more reliable, secure, and efficient.
+ */
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
     if (req.method !== 'POST') {
         return res.status(405).json({ message: 'Method Not Allowed' });
     }
 
-    try {
-        // ✅ الحل النهائي: تنظيف كل المدخلات من المسافات الفارغة
-        const body = req.body;
-        const trimmedBody: { [key: string]: any } = {};
-        for (const key in body) {
-            trimmedBody[key] = typeof body[key] === 'string' ? body[key].trim() : body[key];
-        }
+    // Extract and validate credentials from the request body
+    const { 
+        dbType, 
+        dbHost, 
+        dbPort, 
+        dbUser, 
+        dbPassword, 
+        dbName, 
+        dbRequireSsl 
+    } = req.body;
 
-        const { dbType, dbHost, dbPort, dbUser, dbPassword, dbName, dbRequireSsl } = trimmedBody;
-        if (!dbType || !dbHost || !dbPort || !dbUser) {
-            return res.status(400).json({ error: 'Missing required database credentials for testing.' });
-        }
+    if (!dbType || !dbHost || !dbPort || !dbUser) {
+        return res.status(400).json({ error: 'Missing required database credentials for testing.' });
+    }
 
-        const sslMode = dbRequireSsl ? 'require' : 'prefer';
-        const env = { ...process.env, PGPASSWORD: dbPassword, MYSQL_PWD: dbPassword, PGSSLMODE: sslMode };
-        let command = '';
+    // Use a switch statement to handle different database types
+    switch (dbType) {
+        case 'postgresql':
+            // Use the 'pg' (node-postgres) client
+            const pgClient = new PgClient({
+                host: dbHost,
+                port: Number(dbPort),
+                user: dbUser,
+                password: dbPassword,
+                database: dbName,
+                ssl: dbRequireSsl ? { rejectUnauthorized: false } : false,
+                // Set a connection timeout to prevent long waits
+                connectionTimeoutMillis: 10000, 
+            });
 
-        switch (dbType) {
-            case 'postgresql':
-                command = `psql -h ${dbHost} -p ${dbPort} -U ${dbUser} -d ${dbName} --quiet -c "SELECT 1;"`;
-                break;
-            case 'mysql':
-                const sslOption = dbRequireSsl ? '--ssl-mode=REQUIRED' : '';
-                command = `mysql -h ${dbHost} -P ${dbPort} -u ${dbUser} ${sslOption} -e "SELECT 1;"`;
-                break;
-            case 'mongodb':
-                const mongoURI = `mongodb://${dbUser}:${encodeURIComponent(dbPassword || '')}@${dbHost}:${dbPort}/?authSource=admin&serverSelectionTimeoutMS=5000${dbRequireSsl ? '&ssl=true' : ''}`;
-                command = `mongosh "${mongoURI}" --quiet --eval "db.admin().ping()"`;
-                break;
-            default:
-                return res.status(400).json({ error: 'Unsupported database type' });
-        }
-
-        exec(command, { env, timeout: 10000 }, (error, stdout, stderr) => {
-            if (error) {
-                const cleanError = (stderr || error.message).split('\n')[0].replace('psql: ', '').replace('ERROR: ', '').trim();
-                return res.status(500).json({ error: cleanError });
+            try {
+                await pgClient.connect();
+                await pgClient.end();
+                return res.status(200).json({ message: 'PostgreSQL connection successful!' });
+            } catch (error: any) {
+                return res.status(500).json({ error: error.message });
             }
-            return res.status(200).json({ message: 'Connection successful' });
-        });
-    } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : 'An unknown error occurred.';
-        return res.status(500).json({ error: message });
+
+        case 'mysql':
+            // Use the 'mysql2' client
+            let mysqlConnection;
+            try {
+                mysqlConnection = await mysql.createConnection({
+                    host: dbHost,
+                    port: Number(dbPort),
+                    user: dbUser,
+                    password: dbPassword,
+                    database: dbName,
+                    ssl: dbRequireSsl ? { rejectUnauthorized: false } : undefined,
+                    connectTimeout: 10000,
+                });
+                await mysqlConnection.end();
+                return res.status(200).json({ message: 'MySQL connection successful!' });
+            } catch (error: any) {
+                return res.status(500).json({ error: error.message });
+            } finally {
+                if (mysqlConnection) await mysqlConnection.end();
+            }
+
+        case 'mongodb':
+            // Use the 'mongodb' native driver
+            const mongoURI = `mongodb://${dbUser}:${encodeURIComponent(dbPassword || '')}@${dbHost}:${dbPort}/${dbName || ''}?authSource=admin`;
+            const mongoClient = new MongoClient(mongoURI, {
+                ssl: dbRequireSsl,
+                serverSelectionTimeoutMS: 10000, // Timeout for finding a server
+            });
+            try {
+                await mongoClient.connect();
+                // The ping command is cheap and does not require auth.
+                await mongoClient.db("admin").command({ ping: 1 });
+                return res.status(200).json({ message: 'MongoDB connection successful!' });
+            } catch (error: any) {
+                return res.status(500).json({ error: error.message });
+            } finally {
+                await mongoClient.close();
+            }
+
+        default:
+            return res.status(400).json({ error: 'Unsupported database type' });
     }
 }
